@@ -76,18 +76,116 @@ Together, these five descriptors separate **direct** vs **winding** geometry (st
 - **PCA** is fit **after** the scaler is known, on the same **`X_scaled`**, purely for **2D figures**.
 - Clusters receive **text labels** (e.g. straight, winding, meandering) by comparing cluster **mean** features to a priority list in the notebook (`assign_best`-style rules), so legend names match biology-friendly language rather than arbitrary cluster ids.
 
-### 5. Outputs (CSVs and figures)
+### 5. Outputs — what each file reports (and which parameters it uses)
 
-Under each run’s `pattern_distance_output/` tree you typically find, **per segment length** (e.g. `10mm/`):
+Outputs are organised **per analysis step** and **per segment length** (e.g. `pattern_distance_output/0_global/10mm/` for Exp1 Step 0 global, or `pattern_distance_output/w1118_dehydration_step0/10mm/` for Exp2). Unless noted, **clustering inputs** are always the five **`FEATURE_COLS`** on **`StandardScaler`**-transformed values: **`straightness`**, **`tortuosity`**, **`path_per_40`**, **`mean_abs_turn_deg`**, **`n_turns`**. **K-means** assigns integer **`pattern`**; the notebook then assigns string **`pattern_label`** and coarse **`pattern_group`** using the same priority rules as `NAMING_LABEL_SPECS` in `pattern_export_stats.py` (zig-zag → `n_turns`; straight → `straightness`; meandering → `path_per_40`; curved → `mean_abs_turn_deg`; winding → `tortuosity`; direct → `straightness`; exploratory → `path_per_40` — each step picks an unassigned cluster by max or min of that feature’s cluster mean).
 
-- **`segment_measures.csv`** — one row per segment with features, cluster assignment, and metadata keys (experiment, video id, etc.).
-- **`cluster_means_and_labels.csv`** — cluster centroids and human-readable pattern names.
-- **`cluster_naming_order.csv`** — stable ordering / naming for legends across runs.
-- **`pattern_feature_means.csv`** and **`pattern_feature_means_by_split.csv`** — pattern summaries overall and split by the comparison hue (age, sex, dehydration group, …).
-- **`pca_specification.csv`** — exports from `pattern_export_stats.py` so PCA/scaler choices can be audited or reproduced.
-- **PNG figures** — silhouette vs *k*, pattern counts, PCA scatter coloured by cluster, movement statistics per pattern, and (where implemented) **trajectory snippets** overlaid for representative segments.
+**Notebook toggles:** **`SKIP_PATTERN_FIGURES`** skips PNG generation only (clustering and CSVs that do not depend on plots still run). **`ONLY_CLUSTER_NAMING_ORDER_CSV`** writes only **`cluster_naming_order.csv`** (skips large **`segment_measures.csv`** and aggregate tables) to save disk I/O.
 
-The notebooks expose toggles such as **`SKIP_PATTERN_FIGURES`** (recompute clusters but skip slow PNG regeneration) and **`ONLY_CLUSTER_NAMING_ORDER_CSV`** for lighter exports.
+---
+
+#### `step0_pattern_summary.csv` (Step 0–style global summary)
+
+**Location:** e.g. `0_global/step0_pattern_summary.csv` (Exp1 global Step 0), or `w1118_dehydration_step0/step0_pattern_summary.csv` (Exp2 dehydration run). Not inside each `Nmm` folder.
+
+**What it tells you:** For **each** segment length run, a single-row summary of how many patterns the data support and how confident the silhouette score is.
+
+**Columns (parameters):**
+
+| Column | Meaning |
+|--------|---------|
+| `segment_length_mm` | Nominal segment length (5, 10, …) for that row. |
+| `n_segments` | Number of segments after quality filters (e.g. valid `straightness` / `tortuosity` / `path_per_40`). |
+| `n_patterns_k` | Chosen **K-means k** (best silhouette over the searched range). |
+| `n_distinct_labels` | How many unique **`pattern_label`** strings were assigned after post-hoc naming. |
+| `best_silhouette` | Maximum silhouette score over candidate *k* (computed on **`X_scaled`**, same space as K-means). |
+| `labels` | Semicolon-separated list of distinct **`pattern_label`** values for that length. |
+
+---
+
+#### `segment_measures.csv`
+
+**What it tells you:** The **segment-level dataset** used for clustering: every row is one spatial segment of one video, with measured kinematics and the **final cluster assignment**. Use this for downstream statistics, mixed models, or replotting without re-running the notebook.
+
+**Parameters / columns (in order of export):**
+
+- **`step_name`**, **`segment_length_mm`** — which analysis and distance window produced the row (e.g. `step0_global`, `10`).
+- **IDs / grouping (included when present on `seg_clean`):** `experiment_id`, `detection_run_id`, `category`, `age_group`, `sex`.
+- **Segment geometry / timing:** `seg_40` (segment index along cumulative distance), `n_rows` (frames in segment), `t_start_s`, `t_end_s`, `seg_path_mm`, `seg_dur_s`, `speed_mean_mm_s`.
+- **Features used for K-means:** the five **`FEATURE_COLS`** (raw scale, not z-scores — scaling is internal to the notebook).
+- **Cluster outputs:** `pattern` (integer cluster id from K-means), `pattern_label` (human-readable name), `pattern_group` (coarser legend bucket, e.g. “Straight”, “Zig-zag / reversing”).
+
+PCA coordinates are **not** stored in this file (they are plot-only in the notebook).
+
+---
+
+#### `cluster_means_and_labels.csv`
+
+**What it tells you:** **Cluster centroids** in feature space: for each K-means cluster (`pattern`), what the **average** locomotion profile looks like, how many segments fell in that cluster, and what label was attached.
+
+**Parameters / columns:**
+
+- **`step_name`**, **`segment_length_mm`**, optional **`experiment_id`** / **`detection_run_id`** for scoped runs.
+- **`pattern`** — cluster id; **`n_segments`** — count of segments in that cluster.
+- **`mean_<feature>`** for each of **`FEATURE_COLS`** — arithmetic mean of raw features over segments in that cluster (same units as `segment_measures`; not the scaler-centroid unless you re-derive).
+- **`pattern_label`**, **`pattern_group`** — post-hoc names from the priority-based assignment.
+
+Use this file to **justify** pattern names in text (“the cluster labelled winding has the highest mean tortuosity …”).
+
+---
+
+#### `cluster_naming_order.csv`
+
+**What it tells you:** The **exact order** in which clusters received their **`pattern_label`**: which naming step ran first, which **decision feature** and **max/min rule** picked which **`pattern_cluster_id`**, and the cluster mean of that decision feature. Also includes **`cluster_mean_<feature>`** for **all** five features at that step so you can audit the full mean vector of the cluster that was named.
+
+**Parameters / columns:** `naming_step`, `pattern_label_assigned`, `decision_feature`, `decision_op` (`max` or `min`), `pattern_cluster_id`, `cluster_mean_of_decision_feature`, plus `cluster_mean_*` for each feature in **`FEATURE_COLS`**.
+
+This matches the notebook’s **`assign_best`** logic and is the right file to cite when explaining **why** a cluster is called “zig-zag” vs “meandering”.
+
+---
+
+#### `pattern_feature_means.csv`
+
+**What it tells you:** For each **named** pattern (`pattern`, `pattern_label`, `pattern_group`), the **mean and standard deviation** of every feature across all segments assigned to that pattern — i.e. **distribution shape** within each pattern class.
+
+**Parameters / columns:** `step_name`, `segment_length_mm`, then grouping keys `pattern`, `pattern_label`, `pattern_group`, then for each feature in **`FEATURE_COLS`**: `mean_<feature>`, `std_<feature>`, and **`n_segments`** (how many segments contributed).
+
+---
+
+#### `pattern_feature_means_by_split.csv`
+
+**What it tells you:** Same as **`pattern_feature_means.csv`**, but **stratified** so you can compare patterns between cohorts. Written only when the segment table has usable **`age_group`** and/or **`sex`** columns.
+
+**Extra grouping parameters:** adds **`age_group`** and/or **`sex`** to the group-by keys, so each row is a unique combination of (pattern identity × cohort slice). Still aggregates **`FEATURE_COLS`** with `mean` / `std` / segment counts.
+
+Use this to ask: “within the **meandering** pattern, do young males differ from old females in **mean_abs_turn_deg** variance?” without re-aggregating from `segment_measures.csv`.
+
+---
+
+#### `pca_specification.csv`
+
+**What it tells you:** How **PC1** and **PC2** were constructed from the **scaled** five features: documented **reproducibility** for the 2D PCA figures, not the K-means partition.
+
+**Parameters:** Comment header lines record `explained_variance_ratio` for PC1 and PC2, cumulative variance for the plane, `n_segments`, `k_patterns`, `analysis_id`. The table has one row per feature with **`scaler_mean`**, **`scaler_scale`** (StdScaler), **`pca_mean_on_scaled_input`**, **`loading_PC1`**, **`loading_PC2`**. See `export_pca_specification_csv` in `pattern_export_stats.py` for the reconstruction formulas.
+
+---
+
+#### Figure outputs (PNG) — Step 0 naming (`step0_*.png` in each `Nmm/` folder)
+
+Figures are **readouts** of the same clustering; axes are drawn from **segment-level** fields after clustering.
+
+| File (typical) | What it shows | Main parameters on axes / hue |
+|----------------|----------------|--------------------------------|
+| **`step0_silhouette_k.png`** | **Left:** silhouette vs candidate *k*; **right:** K-means inertia vs *k*. Vertical line at chosen **`n_patterns_k`**. | *k*; silhouette on **`X_scaled`** assignments; inertia in scaled space. |
+| **`step0_pattern_counts.png`** | Bar chart: how many segments per **`pattern_label`**. | Count vs label (derived from **`FEATURE_COLS`** via clusters). |
+| **`step0_pca_patterns.png`** | Scatter of **PC1** vs **PC2** (PCA on **`X_scaled`**), colour = **`pattern_label`**. | 2D projection of the same five scaled features; cluster hue. |
+| **`step0_movements_per_pattern.png`** | Small multiples: overlaid **trajectories** (x,y translated to segment start) for examples per **`pattern_group`**. Line colour = **YM/YF/OM/OF** if `sex`+`age_group` allow cohort tags, else **young vs old** by `age_group`. | Raw **pixel** trajectories from `df_seg`; not the scaled feature space. |
+| **`step0_movements_avg_turn_per_pattern.png`** | Boxplot: **`mean_abs_turn_deg`** vs **`pattern_group`**, split by cohort or **`age_group`**. | Turn statistic vs pattern; hue = sex×age cohorts or age only. |
+| **`step0_movements_n_turns_per_pattern.png`** | Boxplot: **`n_turns`** vs **`pattern_group`**, same hue logic. | Discrete turn count vs pattern. |
+| **`step0_movements_turn_angle_vs_n_turns.png`** | Scatter: **`mean_abs_turn_deg`** vs **`n_turns`**, coloured by **`pattern_group`**. | Shows how smooth turning vs sharp-turn counts co-vary across segments. |
+| **`step0_actual_positions.png`** | **Full-field** trajectory snippets per pattern in **absolute** image coordinates (not centred). | Raw `x`, `y` with cohort colouring where available. |
+
+**Steps 1–3 and cohort cells** use the same **CSV** names (`segment_measures.csv`, etc.) under their own output folders, and **analogous PNGs** with prefixes like **`step1_`** or cohort-specific names (`pattern_k_selection.png`, `pattern_by_age_group_stacked.png`, …). The **quantities** on the axes remain the **`FEATURE_COLS`** and derived **`pattern` / `pattern_label` / `pattern_group`**, plus whatever **comparison dimension** that step defines (per-fly, male/female pools, young/old, etc.).
 
 ---
 
