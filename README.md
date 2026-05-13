@@ -1,6 +1,6 @@
 # Fly trajectory pattern analysis (60 fps)
 
-This repository holds two Jupyter pipelines that turn **2D fly trajectories** from automated detection into **discrete movement patterns** (clusters) and compare those patterns across biological conditions. Both use the same **segmentation logic**, **kinematic features**, **standardization**, **PCA for visualization**, and **K-means** machinery; they differ in **which experiments are pooled** and **how videos are labeled**.
+This repository holds two Jupyter pipelines that turn **2D fly trajectories** from automated detection into **discrete movement patterns** (clusters) and compare those patterns across biological conditions. Both use the same **segmentation logic**, **kinematic features**, **standardization**, **PCA (for 2D plots)**, and **K-means on scaled features**; they differ in **which experiments are pooled** and **how videos are labeled**.
 
 ---
 
@@ -10,29 +10,73 @@ This repository holds two Jupyter pipelines that turn **2D fly trajectories** fr
 
 For each video, the code walks along the path in **image coordinates**, converts steps to millimetres using per-run or default **mm per pixel** scales (defaults: **0.04 mm/px** on x, **0.05 mm/px** on y unless overridden in `MM_PER_PX_BY_RUN` or similar), and builds **cumulative distance** along the track. The recording is then split into consecutive **segments of fixed path length**. By default the same six lengths are used everywhere: **5, 10, 15, 20, 30, and 40 mm**. Each segment is one row in the clustering table (one statistical unit).
 
-### 2. Segment-level features
+### 2. Segment-level features (exact definitions)
 
-For every segment, five **shape / locomotion descriptors** are computed (`FEATURE_COLS` in the notebooks):
+Each **segment** is a slice of one trajectory between two cumulative-distance boundaries (see “From trajectory to segments” above). For that slice the code aggregates frame-level rows, then computes five columns in **`FEATURE_COLS`**. Intermediate quantities:
 
-| Column | Role |
-|--------|------|
-| `straightness` | How direct the path is within the segment (end-to-end vs path length). |
-| `tortuosity` | How winding or convoluted the path is. |
-| `path_per_40` | Path length in the segment expressed relative to a **40 mm** reference scale (helps compare across segment lengths). |
-| `mean_abs_turn_deg` | Mean absolute **heading change** between successive steps, in degrees (from `arctan2` of displacements). |
-| `n_turns` | Count of heading changes above **`TURN_THRESHOLD_DEG`** (default **15°**); sharp turns are treated as discrete events. |
+- **`seg_path_mm`** — sum of **`step_dist_mm`** over all frames in the segment (contour / path length along the sampled track in millimetres).
+- **`net_disp_mm`** — straight-line distance in millimetres from the **first** `(x, y)` to the **last** `(x, y)` in the segment, using separate **`mm_per_px_x`** and **`mm_per_px_y`** so horizontal and vertical distances are scaled independently (anisotropic pixels).
 
-Together these capture whether a fly moved in a roughly straight line, curved gently, zig-zagged, meandered, etc., over a fixed distance window.
+#### `straightness`
 
-### 3. Clustering and choice of *k*
+**straightness = net_disp_mm / seg_path_mm**
 
-- Features are **z-scored** with `sklearn.preprocessing.StandardScaler`.
-- **PCA** is fit on the scaled features for **2D visualisation** and interpretability; clustering is still done in the scaled feature space (PCA is not the sole driver of assignments unless the notebook path specifies otherwise for a given step).
-- **K-means** is run for candidate cluster counts **k = 2 … 10**.
-- The implementation uses the **silhouette score** to pick the **k** that best separates segments into coherent clusters at each segment length.
-- Clusters receive **text labels** (e.g. straight, curved, meandering) from their mean feature profiles so figures are readable in a paper or talk.
+This is the ratio of **chord length** (start-to-end displacement) to **integrated path length**. It lies in **(0, 1]** for typical non-degenerate paths: a perfectly straight walk gives **1**; the more the animal doubles back or meanders, the **smaller** straightness becomes because the chord is short relative to the distance actually walked. Rows with zero path length are dropped or treated as missing.
 
-### 4. Outputs (CSVs and figures)
+#### `tortuosity`
+
+**tortuosity = seg_path_mm / net_disp_mm**
+
+This is the **reciprocal** of straightness (with **`net_disp_mm`** clipped to a small floor to avoid division by zero). Values near **1** indicate an almost straight segment; **larger** values indicate a more convoluted path. In the literature “tortuosity” is defined in several ways; here it is explicitly **path length divided by net displacement**, matching the code.
+
+#### `path_per_40` (name vs formula)
+
+Despite the name, the implementation computes:
+
+**path_per_40 = seg_path_mm / SEGMENT_LENGTH_MM**
+
+where **`SEGMENT_LENGTH_MM`** is the **current** analysis window (5, 10, 15, … mm) for that run—not a fixed 40 mm divisor. So this quantity is **actual contour length in the segment bucket, normalised by the nominal segment length** for that analysis. It is useful for comparing how “filled” or distance-efficient the tracked motion is **within** each segment-length setting. Values clustered around **1** mean the summed step lengths in that bin match the nominal window; systematic deviations reflect how segmentation and sampling interact with real motion.
+
+#### `mean_abs_turn_deg`
+
+For every consecutive pair of steps inside the segment, the heading is atan2(Δy, Δx) for each displacement. Successive headings are differenced and wrapped to **(−π, π]**, then converted to **absolute degrees**. **`mean_abs_turn_deg`** is the **mean** of those unsigned turn angles over the segment. It captures **average sharpness** of heading changes at each step: smooth gentle curves tend toward **smaller** means; jittery or rapidly turning motion yields **larger** means. It does not, by itself, count discrete “events”—that is what **`n_turns`** is for.
+
+#### `n_turns` and `TURN_THRESHOLD_DEG`
+
+Using the same wrapped heading differences in degrees, **`n_turns`** counts how many consecutive steps exceed **`TURN_THRESHOLD_DEG`** (default **15°** in the notebooks). Only angles **strictly above** the threshold count. This is a **discrete** count of relatively sharp turning events, useful for separating **zig-zag**-like bouts from paths that turn slowly. The default (15°) is on the conservative side compared with some gait papers that use 22–45°; you can change **`TURN_THRESHOLD_DEG`** in the notebook if you want fewer or more events per segment.
+
+Together, these five descriptors separate **direct** vs **winding** geometry (straightness / tortuosity / path ratio), **fine-scale heading volatility** (mean_abs_turn_deg), and **discrete sharp turns** (n_turns).
+
+---
+
+### 3. Principal component analysis (PCA)
+
+**Role in this pipeline:** PCA is used for **visualisation and reporting**, not as the space in which clusters are found.
+
+**Procedure (as in the notebooks):**
+
+1. Build matrix **`X`** with one row per segment and columns **`FEATURE_COLS`** (raw feature scales differ a lot between columns, so the next step matters).
+2. Fit **`StandardScaler`** on **`X`** and transform to **`X_scaled`** (zero mean, unit variance per column across segments in that run). **K-means** and **silhouette** scores are computed on **`X_scaled`** only—i.e. in **five-dimensional scaled feature space**.
+3. Fit **`sklearn.decomposition.PCA`** with **`n_components=2`** and **`random_state=42`** on the **same** **`X_scaled`**, and transform to **(PC1, PC2)** for scatter plots.
+
+**Interpretation:**
+
+- **PC1** and **PC2** are orthogonal directions of maximum variance **after** z-scoring. Each component is a linear combination of the five features; the **loadings** (rows of `pca.components_`) tell you which raw (scaled) features push a segment left/right or up/down on the PCA plot.
+- **Explained variance ratio** per component is reported in **`pca_specification.csv`** (and related export helpers in `pattern_export_stats.py`): it answers how much of the total variance in scaled features is captured by this 2D view. Often PC1+PC2 explain only a **fraction** of variance—so the PCA scatter is a **projection** for intuition; cluster membership still reflects **all five** scaled dimensions.
+
+**Reproducibility:** `export_pca_specification_csv` writes **`pca_specification.csv`** with, per feature: scaler mean/scale, PCA center on scaled input, and loadings for PC1 and PC2, plus header lines with explained variance ratios. The file documents the reconstruction consistent with scikit-learn: scaled features are z-scores, then PCA applies its internal centering and projection (see comments in `pattern_export_stats.py`).
+
+---
+
+### 4. Clustering and choice of *k*
+
+- **Input to clustering:** **`X_scaled`** (standardised **`FEATURE_COLS`**), **not** PCA coordinates.
+- **K-means** (`random_state=42`, `n_init=10`) is run for candidate **`k`** in a range (typically **2 … 10**, upper bound capped when there are very few segments).
+- The **silhouette score** on **`X_scaled`** selects **`k`** with the best average cohesion/separation for that segment length.
+- **PCA** is fit **after** the scaler is known, on the same **`X_scaled`**, purely for **2D figures**.
+- Clusters receive **text labels** (e.g. straight, winding, meandering) by comparing cluster **mean** features to a priority list in the notebook (`assign_best`-style rules), so legend names match biology-friendly language rather than arbitrary cluster ids.
+
+### 5. Outputs (CSVs and figures)
 
 Under each run’s `pattern_distance_output/` tree you typically find, **per segment length** (e.g. `10mm/`):
 
